@@ -23,6 +23,7 @@ members = [
   "components/bootstrappers/platform",
   "components/bootstrappers/scriptfile",
   "components/bootstrappers/application",
+  "components/bootstrappers/mongodb",
   "components/bootstrappers/noop",
 
   # Reaction Plugins
@@ -84,8 +85,6 @@ drasi-lib = { version = "0.3.8", path = "lib" }
 
 # Component plugins
 drasi-source-postgres = { version = "0.1.8", path = "components/sources/postgres" }
-drasi-source-application = { version = "0.1.7", path = "components/sources/application" }
-drasi-bootstrap-application = { version = "0.1.7", path = "components/bootstrappers/application" }
 drasi-reaction-http = { version = "0.1.8", path = "components/reactions/http" }
 drasi-reaction-grpc = { version = "0.2.5", path = "components/reactions/grpc" }
 drasi-index-rocksdb = { version = "0.2.2", path = "components/indexes/rocksdb" }

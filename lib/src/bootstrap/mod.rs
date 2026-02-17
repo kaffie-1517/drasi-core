@@ -212,6 +212,25 @@ pub struct ScriptFileBootstrapConfig {
     pub file_paths: Vec<String>,
 }
 
+/// MongoDB bootstrap provider configuration
+///
+/// This provider bootstraps initial data from MongoDB collections.
+/// Detailed configuration is handled by the drasi-bootstrap-mongodb crate.
+///
+/// # Example
+/// ```yaml
+/// bootstrap_provider:
+///   type: mongodb
+///   connection_string: "mongodb://localhost:27017"
+///   database: "mydb"
+///   collections: ["users", "orders"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MongoBootstrapConfig {
+    // Configuration handled by component crate
+    // Include for consistency and future extensibility
+}
+
 /// Platform bootstrap provider configuration
 ///
 /// This provider bootstraps data from a Query API service running in a remote
@@ -263,6 +282,8 @@ pub enum BootstrapProviderConfig {
     /// Platform bootstrap provider for remote Drasi sources
     /// Bootstraps data from a Query API service running in a remote Drasi environment
     Platform(PlatformBootstrapConfig),
+    /// MongoDB bootstrap provider
+    Mongodb(MongoBootstrapConfig),
     /// No-op bootstrap provider (returns no data)
     Noop,
 }
@@ -311,6 +332,12 @@ impl BootstrapProviderFactory {
                     "Platform bootstrap provider is available in the drasi-bootstrap-platform crate. \
                      Use PlatformBootstrapProvider::builder().with_query_api_url(...).build() to create it. \
                      Config: {config:?}"
+                ))
+            }
+            BootstrapProviderConfig::Mongodb(_) => {
+                Err(anyhow::anyhow!(
+                    "MongoDB bootstrap provider is available in the drasi-bootstrap-mongodb crate. \
+                     Use MongoBootstrapProvider::builder().with_connection_string(...).build() to create it."
                 ))
             }
             BootstrapProviderConfig::Noop => {
@@ -499,6 +526,17 @@ query_api_url: "http://test:8080" # DevSkim: ignore DS137138
         });
 
         assert_eq!(config1, config2);
+    }
+
+    #[test]
+    fn test_mongodb_bootstrap_config_serialization() {
+        let config = BootstrapProviderConfig::Mongodb(MongoBootstrapConfig::default());
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"type\":\"mongodb\""));
+
+        let deserialized: BootstrapProviderConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, BootstrapProviderConfig::Mongodb(_)));
     }
 
     #[test]
