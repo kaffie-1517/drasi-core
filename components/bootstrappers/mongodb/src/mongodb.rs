@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use drasi_core::models::{Element, ElementMetadata, ElementReference, SourceChange};
 use drasi_lib::bootstrap::{BootstrapContext, BootstrapProvider, BootstrapRequest};
 use futures::stream::TryStreamExt;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use mongodb::{options::ClientOptions, Client};
 
 use std::sync::Arc;
@@ -105,19 +105,14 @@ impl BootstrapProvider for MongoBootstrapProvider {
         request: BootstrapRequest,
         context: &BootstrapContext,
         event_tx: drasi_lib::channels::BootstrapEventSender,
-        settings: Option<&drasi_lib::config::SourceSubscriptionSettings>,
+        _settings: Option<&drasi_lib::config::SourceSubscriptionSettings>,
     ) -> Result<usize> {
         info!(
-            "Starting bootstrap for query {} from source {} (nodes: {:?}, relations: {:?})",
-            request.query_id, context.source_id, request.node_labels, request.relation_labels
+            "Starting MongoDB bootstrap for query '{}' with {} node labels and {} relation labels",
+            request.query_id,
+            request.node_labels.len(),
+            request.relation_labels.len()
         );
-
-        if let Some(s) = settings {
-            info!(
-                "Bootstrap for query {} (enable_bootstrap: {}, nodes: {:?}, relations: {:?})",
-                s.query_id, s.enable_bootstrap, s.nodes, s.relations
-            );
-        }
 
         let client = self
             .client
@@ -131,31 +126,28 @@ impl BootstrapProvider for MongoBootstrapProvider {
 
         let db = client.database(&self.config.database);
 
-        // Filter collections based on request labels
-        // If request.node_labels is empty, we do nothing (scan 0 collections) per requirements.
-        // If config.collections is set, we only scan those that are ALSO in request.node_labels.
-        // Actually, requirement says "Only bootstraps collections matching requested node labels".
-        // It implies the source of truth for "what exists" is the DB, but we filter by request.
-
-        let resolved_collections = resolve_collections_to_scan(&self.config.collections, &request.node_labels);
+        // Determine which collections to scan: the intersection of configured
+        // collections (if any) and the node labels requested by the query.
+        // If request.node_labels is empty, no collections are scanned.
+        let resolved_collections =
+            resolve_collections_to_scan(&self.config.collections, &request.node_labels);
         if resolved_collections.is_empty() {
             return Ok(0);
         }
 
-        // Validate collections exist
-        let existing_collections: std::collections::HashSet<String> = db
-            .list_collection_names(None)
-            .await?
-            .into_iter()
-            .collect();
-            
+        // Validate that each resolved collection actually exists in the database.
+        let existing_collections: std::collections::HashSet<String> =
+            db.list_collection_names(None).await?.into_iter().collect();
+
         let mut collections_to_scan = Vec::new();
         for collection_name in resolved_collections {
             if existing_collections.contains(&collection_name) {
                 collections_to_scan.push(collection_name);
             } else {
-                warn!("Collection '{collection_name}' does not exist, skipping");
-                // Log warning similar to Postgres "Table does not exist"
+                warn!(
+                    "Collection '{collection_name}' does not exist in database '{}', skipping",
+                    self.config.database
+                );
             }
         }
 
@@ -164,7 +156,11 @@ impl BootstrapProvider for MongoBootstrapProvider {
             return Ok(0);
         }
 
-        info!("Resolved {} verified collections to scan: {:?}", collections_to_scan.len(), collections_to_scan);
+        info!(
+            "Resolved {} verified collections to scan: {:?}",
+            collections_to_scan.len(),
+            collections_to_scan
+        );
 
         let mut total_count = 0;
         let mut batch = Vec::with_capacity(self.config.batch_size as usize);
@@ -180,27 +176,25 @@ impl BootstrapProvider for MongoBootstrapProvider {
             let mut cursor = collection.find(None, find_options).await?;
 
             while let Some(doc) = cursor.try_next().await? {
-                // Convert doc to BootstrapEvent
-                // Fail fast on error to match Postgres behavior
                 let event = self.process_document(&doc, &collection_name, context)?;
-
                 batch.push(event);
 
                 if batch.len() >= self.config.batch_size as usize {
+                    let flushed = batch.len();
                     self.send_batch(&mut batch, event_tx.clone()).await?;
-                    total_count += self.config.batch_size as usize;
+                    total_count += flushed;
                 }
             }
         }
 
-        // Send remaining events
+        // Send any remaining events that did not fill a complete batch.
         if !batch.is_empty() {
             total_count += batch.len();
             self.send_batch(&mut batch, event_tx).await?;
         }
 
         info!(
-            "Completed bootstrap for query {}: sent {} elements",
+            "Completed MongoDB bootstrap for query '{}': sent {} elements",
             request.query_id, total_count
         );
         Ok(total_count)
@@ -218,7 +212,7 @@ impl MongoBootstrapProvider {
 
         let mut properties = drasi_core::models::ElementPropertyMap::new();
 
-        // Map top-level fields, excluding _id (it's in the element_id)
+        // Map all top-level fields except _id (already encoded in element_id).
         for (key, value) in doc {
             if key != "_id" {
                 properties.insert(key, bson_to_element_value(value));
@@ -241,7 +235,6 @@ impl MongoBootstrapProvider {
         Ok(self.create_event(change, context))
     }
 
-    /// Create a BootstrapEvent from a SourceChange
     fn create_event(
         &self,
         change: SourceChange,
@@ -264,29 +257,28 @@ impl MongoBootstrapProvider {
             event_tx
                 .send(event)
                 .await
-                .map_err(|e| anyhow!("Failed to send event: {e}"))?;
+                .map_err(|e| anyhow!("Failed to send bootstrap event to channel: {e}"))?;
         }
         Ok(())
     }
 }
 
+/// Resolve which collections to scan given the configured allow-list and the
+/// labels requested by the query.
+///
+/// - If `requested` is empty → scan nothing (return empty).
+/// - If `configured` is empty → scan everything in `requested`.
+/// - Otherwise → scan the intersection of `configured` and `requested`.
 fn resolve_collections_to_scan(configured: &[String], requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
         warn!("No node labels requested, skipping bootstrap");
         return Vec::new();
     }
 
-    // We use the intersection of configured collections (if any) and requested labels
     requested
         .iter()
+        .filter(|label| configured.is_empty() || configured.contains(label))
         .map(|s| s.to_string())
-        .filter(|label| {
-            if configured.is_empty() {
-                true
-            } else {
-                configured.contains(label)
-            }
-        })
         .collect()
 }
 
@@ -297,7 +289,7 @@ mod tests {
     #[test]
     fn test_resolve_collections_empty_request() {
         let configured = vec!["users".to_string()];
-        let requested = vec![];
+        let requested: Vec<String> = vec![];
         let resolved = resolve_collections_to_scan(&configured, &requested);
         assert!(resolved.is_empty());
     }
@@ -312,9 +304,36 @@ mod tests {
 
     #[test]
     fn test_resolve_collections_open_config() {
-        let configured = vec![];
+        let configured: Vec<String> = vec![];
         let requested = vec!["users".to_string(), "products".to_string()];
         let resolved = resolve_collections_to_scan(&configured, &requested);
-        assert_eq!(resolved, vec!["users".to_string(), "products".to_string()]);
+        assert_eq!(
+            resolved,
+            vec!["users".to_string(), "products".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_collections_fully_disjoint() {
+        // configured and requested have no overlap → nothing to scan
+        let configured = vec!["users".to_string(), "orders".to_string()];
+        let requested = vec!["products".to_string(), "logs".to_string()];
+        let resolved = resolve_collections_to_scan(&configured, &requested);
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_collections_partial_overlap() {
+        let configured = vec!["users".to_string(), "orders".to_string()];
+        let requested = vec![
+            "users".to_string(),
+            "orders".to_string(),
+            "sessions".to_string(),
+        ];
+        let resolved = resolve_collections_to_scan(&configured, &requested);
+        assert_eq!(
+            resolved,
+            vec!["users".to_string(), "orders".to_string()]
+        );
     }
 }

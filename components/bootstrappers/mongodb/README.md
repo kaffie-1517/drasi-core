@@ -8,7 +8,7 @@ The MongoDB Bootstrap Provider streams existing documents from specified MongoDB
 
 ### Key Capabilities
 
-- **Collection Filtering**: Automatically maps Cypher query labels to MongoDB collections and validates their existence.
+- **Collection Filtering**: Automatically mxaps Cypher query labels to MongoDB collections and validates their existence.
 - **Efficient Batching**: Uses MongoDB cursors with configurable batch sizes (default: 1000) to stream large datasets without memory pressure.
 - **Recursive BSON Handling**: Fully supports nested BSON Arrays and Documents, mapping them to Drasi `List` and `Object` types.
 - **Binary Data Support**: Automatically converts BSON Binary fields to Base64-encoded strings.
