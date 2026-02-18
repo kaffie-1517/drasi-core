@@ -19,14 +19,29 @@
 
 use serde::{Deserialize, Serialize};
 
-/// MongoDB bootstrap provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+/// MongoDB bootstrap provider configuration.
+///
+/// The database name is always specified as part of the `connection_string`
+/// URI path (e.g., `mongodb://host:27017/mydb`). This avoids ambiguity
+/// from having the same information in two separate fields.
+///
+/// Credentials can be embedded directly in the connection string. In
+/// production deployments, the entire `connection_string` value should
+/// be sourced from a Kubernetes Secret or environment variable to keep
+/// credentials out of plain-text configuration.
+///
+/// **Security note**: The `Debug` implementation redacts credentials from the
+/// `connection_string` to prevent accidental secret leakage through logging or
+/// debug formatting.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct MongoBootstrapConfig {
-    /// MongoDB connection string
+    /// MongoDB connection string — must include the database name in the URI path.
+    ///
+    /// Examples:
+    /// - `mongodb://localhost:27017/mydb`
+    /// - `mongodb://user:pass@host:27017/mydb?retryWrites=true`
+    /// - `mongodb+srv://user:pass@cluster.example.com/mydb`
     pub connection_string: String,
-
-    /// Database name
-    pub database: String,
 
     /// Collections to bootstrap
     #[serde(default)]
@@ -41,7 +56,79 @@ fn default_batch_size() -> u32 {
     1000
 }
 
+/// Redact userinfo (username:password) from a MongoDB connection string.
+///
+/// `mongodb://user:pass@host:27017/db` → `mongodb://***:***@host:27017/db`
+fn redact_connection_string(conn_str: &str) -> String {
+    if let Some(at_pos) = conn_str.find('@') {
+        if let Some(scheme_end) = conn_str.find("://") {
+            let scheme = &conn_str[..scheme_end + 3];
+            let after_at = &conn_str[at_pos..];
+            return format!("{scheme}***:***{after_at}");
+        }
+    }
+    conn_str.to_string()
+}
+
+/// Extract the database name from a MongoDB connection string URI path.
+///
+/// Parses the path component after the host (and optional port), stripping
+/// any query string. Returns `None` if the path is empty or `/`.
+///
+/// Examples:
+/// - `mongodb://host:27017/mydb` → `Some("mydb")`
+/// - `mongodb://host:27017/mydb?retryWrites=true` → `Some("mydb")`
+/// - `mongodb://user:pass@host:27017/mydb` → `Some("mydb")`
+/// - `mongodb://host:27017` → `None`
+/// - `mongodb://host:27017/` → `None`
+pub(crate) fn parse_database_from_uri(conn_str: &str) -> Option<String> {
+    // Find the host portion — skip past `://`
+    let after_scheme = conn_str
+        .find("://")
+        .map(|i| &conn_str[i + 3..])
+        .unwrap_or(conn_str);
+
+    // Skip past credentials if present
+    let after_userinfo = after_scheme
+        .find('@')
+        .map(|i| &after_scheme[i + 1..])
+        .unwrap_or(after_scheme);
+
+    // Find the first `/` after the host — this starts the database path
+    if let Some(slash_pos) = after_userinfo.find('/') {
+        let path = &after_userinfo[slash_pos + 1..];
+
+        // Strip query string (`?...`) if present
+        let db_name = path.split('?').next().unwrap_or("");
+
+        if !db_name.is_empty() {
+            return Some(db_name.to_string());
+        }
+    }
+
+    None
+}
+
+impl std::fmt::Debug for MongoBootstrapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MongoBootstrapConfig")
+            .field("connection_string", &redact_connection_string(&self.connection_string))
+            .field("database", &parse_database_from_uri(&self.connection_string).unwrap_or_default())
+            .field("collections", &self.collections)
+            .field("batch_size", &self.batch_size)
+            .finish()
+    }
+}
+
 impl MongoBootstrapConfig {
+    /// Extract the database name from the connection string.
+    ///
+    /// Returns `None` if the connection string does not include a database
+    /// in its URI path.
+    pub fn database(&self) -> Option<String> {
+        parse_database_from_uri(&self.connection_string)
+    }
+
     /// Validate the configuration and return an error if invalid.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.connection_string.is_empty() {
@@ -51,10 +138,10 @@ impl MongoBootstrapConfig {
             ));
         }
 
-        if self.database.is_empty() {
+        if self.database().is_none() {
             return Err(anyhow::anyhow!(
-                "Validation error: database cannot be empty. \
-                 Please specify the MongoDB database name"
+                "Validation error: connection_string must include a database name \
+                 in the URI path (e.g., mongodb://host:27017/mydb)"
             ));
         }
 
@@ -76,12 +163,112 @@ mod tests {
     #[test]
     fn test_default_batch_size() {
         let config_json = r#"{
-            "connection_string": "mongodb://localhost:27017",
-            "database": "test",
+            "connection_string": "mongodb://localhost:27017/testdb",
             "collections": ["users"]
         }"#;
 
         let config: MongoBootstrapConfig = serde_json::from_str(config_json).unwrap();
         assert_eq!(config.batch_size, 1000);
+    }
+
+    // --- Database parsing ---
+
+    #[test]
+    fn test_database_from_simple_uri() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017/inventory".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.database(), Some("inventory".to_string()));
+    }
+
+    #[test]
+    fn test_database_from_uri_with_credentials() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://user:pass@host:27017/mydb".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.database(), Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_database_from_uri_with_query_string() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://host:27017/mydb?retryWrites=true&w=majority".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.database(), Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_database_none_when_missing() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.database(), None);
+    }
+
+    #[test]
+    fn test_database_none_for_trailing_slash() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017/".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.database(), None);
+    }
+
+    // --- Validation ---
+
+    #[test]
+    fn test_validate_fails_without_database_in_uri() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017".to_string(),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must include a database name"));
+    }
+
+    #[test]
+    fn test_validate_passes_with_database_in_uri() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017/mydb".to_string(),
+            batch_size: 1000,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // --- Debug redaction ---
+
+    #[test]
+    fn test_debug_redacts_credentials() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://admin:s3cret@db.example.com:27017/mydb".to_string(),
+            collections: vec!["users".to_string()],
+            batch_size: 1000,
+        };
+
+        let debug_output = format!("{:?}", config);
+
+        assert!(!debug_output.contains("admin"), "Username leaked in Debug output");
+        assert!(!debug_output.contains("s3cret"), "Password leaked in Debug output");
+        assert!(debug_output.contains("***:***"), "Redacted placeholder missing");
+        assert!(debug_output.contains("db.example.com"), "Host should be visible");
+        assert!(debug_output.contains("mydb"), "Database should be visible");
+    }
+
+    #[test]
+    fn test_debug_no_credentials_unchanged() {
+        let config = MongoBootstrapConfig {
+            connection_string: "mongodb://localhost:27017/testdb".to_string(),
+            collections: vec![],
+            batch_size: 1000,
+        };
+
+        let debug_output = format!("{:?}", config);
+        assert!(debug_output.contains("testdb"), "Database should be visible in debug");
     }
 }

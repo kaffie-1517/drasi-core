@@ -16,7 +16,6 @@
 
 use anyhow::{anyhow, Result};
 use bson::{Bson, Document};
-use chrono::{DateTime, Utc};
 use drasi_core::models::{ElementPropertyMap, ElementValue};
 use ordered_float::OrderedFloat;
 use std::sync::Arc;
@@ -41,11 +40,15 @@ pub fn bson_to_element_value(bson: &Bson) -> ElementValue {
         Bson::Int32(i) => ElementValue::Integer(*i as i64),
         Bson::Int64(i) => ElementValue::Integer(*i),
         Bson::DateTime(dt) => {
-            // Convert bson::DateTime → chrono::DateTime<Utc> → RFC 3339 string.
-            // Using chrono::to_rfc3339() is equivalent to the bson
-            // try_to_rfc3339_string() path but infallible after the conversion.
-            let dt: DateTime<Utc> = (*dt).into();
-            ElementValue::String(Arc::from(dt.to_rfc3339()))
+            // Use bson's native RFC 3339 serializer (produces "Z" suffix) to
+            // stay consistent with the shared contract (issue #227).
+            match dt.try_to_rfc3339_string() {
+                Ok(s) => ElementValue::String(Arc::from(s)),
+                Err(_) => {
+                    // Fallback for dates outside the representable RFC 3339 range.
+                    ElementValue::String(Arc::from(format!("{}", dt.timestamp_millis())))
+                }
+            }
         }
         Bson::ObjectId(oid) => ElementValue::String(Arc::from(oid.to_hex())),
         Bson::Binary(bin) => {

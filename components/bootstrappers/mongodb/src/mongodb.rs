@@ -47,6 +47,11 @@ impl MongoBootstrapProvider {
     pub fn builder() -> MongoBootstrapProviderBuilder {
         MongoBootstrapProviderBuilder::new()
     }
+
+    /// Access the configuration (for testing/inspection).
+    pub fn config(&self) -> &MongoBootstrapConfig {
+        &self.config
+    }
 }
 
 impl Default for MongoBootstrapProvider {
@@ -72,10 +77,6 @@ impl MongoBootstrapProviderBuilder {
         self
     }
 
-    pub fn with_database(mut self, database: impl Into<String>) -> Self {
-        self.config.database = database.into();
-        self
-    }
 
     pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
         self.config.collections.push(collection.into());
@@ -124,7 +125,13 @@ impl BootstrapProvider for MongoBootstrapProvider {
             })
             .await?;
 
-        let db = client.database(&self.config.database);
+        // Extract the database name from the connection string URI path.
+        let database_name = self.config.database().ok_or_else(|| {
+            anyhow!("connection_string must include a database name in the URI path \
+                     (e.g., mongodb://host:27017/mydb)")
+        })?;
+
+        let db = client.database(&database_name);
 
         // Determine which collections to scan: the intersection of configured
         // collections (if any) and the node labels requested by the query.
@@ -145,8 +152,7 @@ impl BootstrapProvider for MongoBootstrapProvider {
                 collections_to_scan.push(collection_name);
             } else {
                 warn!(
-                    "Collection '{collection_name}' does not exist in database '{}', skipping",
-                    self.config.database
+                    "Collection '{collection_name}' does not exist in database '{database_name}', skipping",
                 );
             }
         }
@@ -176,6 +182,13 @@ impl BootstrapProvider for MongoBootstrapProvider {
             let mut cursor = collection.find(None, find_options).await?;
 
             while let Some(doc) = cursor.try_next().await? {
+                // Filter BEFORE creating Element (saves allocation) — as per Developer Guide.
+                // The document's label is its collection name; skip if it
+                // doesn't match the requested labels.
+                if !matches_labels(&[collection_name.clone()], &request.node_labels) {
+                    continue;
+                }
+
                 let event = self.process_document(&doc, &collection_name, context)?;
                 batch.push(event);
 
@@ -282,6 +295,20 @@ fn resolve_collections_to_scan(configured: &[String], requested: &[String]) -> V
         .collect()
 }
 
+/// Per-document label filter as recommended by the Developer Guide.
+///
+/// Returns `true` if the element should be included:
+/// - If no labels are requested → include all.
+/// - Otherwise → include if any element label is in the requested set.
+fn matches_labels(element_labels: &[String], requested_labels: &[String]) -> bool {
+    if requested_labels.is_empty() {
+        return true;
+    }
+    element_labels
+        .iter()
+        .any(|label| requested_labels.contains(label))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +362,161 @@ mod tests {
             resolved,
             vec!["users".to_string(), "orders".to_string()]
         );
+    }
+
+    /// Verifies that sequence numbers produced by `process_document` are
+    /// strictly monotonically increasing when processing multiple documents —
+    /// exercising the real code path (BSON → Element → BootstrapEvent).
+    #[test]
+    fn test_sequence_numbers_are_monotonic() {
+        let context = BootstrapContext::new_minimal(
+            "test-server".to_string(),
+            "test-source".to_string(),
+        );
+
+        let provider = MongoBootstrapProvider::default();
+
+        // Simulate processing multiple realistic BSON documents
+        let docs: Vec<bson::Document> = (0..10)
+            .map(|i| {
+                bson::doc! {
+                    "_id": bson::oid::ObjectId::new(),
+                    "name": format!("user_{i}"),
+                    "index": i as i32,
+                }
+            })
+            .collect();
+
+        let mut sequences = Vec::new();
+        for doc in &docs {
+            let event = provider
+                .process_document(doc, "users", &context)
+                .expect("process_document should succeed");
+            sequences.push(event.sequence);
+        }
+
+        // Every sequence number must be strictly greater than the previous
+        for i in 1..sequences.len() {
+            assert!(
+                sequences[i] > sequences[i - 1],
+                "Sequence numbers must be strictly increasing: seq[{}]={} is not > seq[{}]={}",
+                i,
+                sequences[i],
+                i - 1,
+                sequences[i - 1]
+            );
+        }
+
+        // First sequence should start at 0 (AtomicU64 initialized to 0, fetch_add returns previous value)
+        assert_eq!(sequences[0], 0, "First sequence number should be 0");
+        assert_eq!(sequences[9], 9, "Last sequence number should be 9");
+    }
+
+    /// Verifies that `process_document` produces correct BootstrapEvents with the
+    /// expected source_id, SourceChange::Insert variant, and element metadata.
+    #[test]
+    fn test_process_document_creates_correct_event() {
+        let context = BootstrapContext::new_minimal(
+            "test-server".to_string(),
+            "test-source".to_string(),
+        );
+
+        let provider = MongoBootstrapProvider::default();
+
+        let doc = bson::doc! {
+            "_id": bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            "name": "Alice",
+            "age": 30_i32,
+        };
+
+        let event = provider
+            .process_document(&doc, "users", &context)
+            .expect("process_document should succeed");
+
+        // Event should have the correct source_id
+        assert_eq!(event.source_id, "test-source");
+
+        // Event change should be Insert
+        match &event.change {
+            SourceChange::Insert { element } => {
+                match element {
+                    Element::Node {
+                        metadata,
+                        properties,
+                    } => {
+                        // Element ID = "users:507f1f77bcf86cd799439011"
+                        assert_eq!(
+                            metadata.reference.element_id.as_ref(),
+                            "users:507f1f77bcf86cd799439011"
+                        );
+                        assert_eq!(metadata.reference.source_id.as_ref(), "test-source");
+                        assert_eq!(metadata.effective_from, 0);
+
+                        // Labels = ["users"]
+                        assert_eq!(metadata.labels.len(), 1);
+                        assert_eq!(metadata.labels[0].as_ref(), "users");
+
+                        // Properties should NOT contain _id, but should contain name and age
+                        assert!(properties.get("_id").is_none());
+                        assert_eq!(
+                            properties.get("name").unwrap(),
+                            &drasi_core::models::ElementValue::String(Arc::from("Alice"))
+                        );
+                        assert_eq!(
+                            properties.get("age").unwrap(),
+                            &drasi_core::models::ElementValue::Integer(30)
+                        );
+                    }
+                    _ => panic!("Expected Element::Node"),
+                }
+            }
+            _ => panic!("Expected SourceChange::Insert"),
+        }
+    }
+
+    /// Verifies that events can be successfully sent through an mpsc channel,
+    /// matching the Developer Guide's recommended test pattern.
+    #[tokio::test]
+    async fn test_send_batch_delivers_events() {
+        let context = BootstrapContext::new_minimal(
+            "test-server".to_string(),
+            "test-source".to_string(),
+        );
+
+        let provider = MongoBootstrapProvider::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        // Create a batch of events
+        let mut batch = Vec::new();
+        for i in 0..5 {
+            let element = Element::Node {
+                metadata: ElementMetadata {
+                    reference: ElementReference::new("test-source", &format!("col:{i}")),
+                    labels: Arc::from(vec![Arc::from("col")]),
+                    effective_from: 0,
+                },
+                properties: drasi_core::models::ElementPropertyMap::new(),
+            };
+            let change = SourceChange::Insert { element };
+            batch.push(provider.create_event(change, &context));
+        }
+
+        // Send the batch
+        provider
+            .send_batch(&mut batch, tx)
+            .await
+            .expect("send_batch should succeed");
+
+        // Batch should be drained
+        assert!(batch.is_empty());
+
+        // All events should be received
+        let mut received = 0;
+        while let Ok(event) = rx.try_recv() {
+            assert_eq!(event.source_id, "test-source");
+            assert!(matches!(event.change, SourceChange::Insert { .. }));
+            received += 1;
+        }
+        assert_eq!(received, 5);
     }
 }
