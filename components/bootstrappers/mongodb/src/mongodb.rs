@@ -78,6 +78,13 @@ impl MongoBootstrapProviderBuilder {
     }
 
 
+    /// Set the collections to bootstrap
+    pub fn with_collections(mut self, collections: Vec<String>) -> Self {
+        self.config.collections = collections;
+        self
+    }
+
+    /// Add a single collection to bootstrap
     pub fn with_collection(mut self, collection: impl Into<String>) -> Self {
         self.config.collections.push(collection.into());
         self
@@ -125,7 +132,7 @@ impl BootstrapProvider for MongoBootstrapProvider {
             })
             .await?;
 
-        // Extract the database name from the connection string URI path.
+        // Extract database name from URI path
         let database_name = self.config.database().ok_or_else(|| {
             anyhow!("connection_string must include a database name in the URI path \
                      (e.g., mongodb://host:27017/mydb)")
@@ -133,16 +140,14 @@ impl BootstrapProvider for MongoBootstrapProvider {
 
         let db = client.database(&database_name);
 
-        // Determine which collections to scan: the intersection of configured
-        // collections (if any) and the node labels requested by the query.
-        // If request.node_labels is empty, no collections are scanned.
+        // Resolve collections to scan
         let resolved_collections =
             resolve_collections_to_scan(&self.config.collections, &request.node_labels);
         if resolved_collections.is_empty() {
             return Ok(0);
         }
 
-        // Validate that each resolved collection actually exists in the database.
+        // Validate collections exist in database
         let existing_collections: std::collections::HashSet<String> =
             db.list_collection_names(None).await?.into_iter().collect();
 
@@ -182,9 +187,7 @@ impl BootstrapProvider for MongoBootstrapProvider {
             let mut cursor = collection.find(None, find_options).await?;
 
             while let Some(doc) = cursor.try_next().await? {
-                // Filter BEFORE creating Element (saves allocation) — as per Developer Guide.
-                // The document's label is its collection name; skip if it
-                // doesn't match the requested labels.
+                // Skip documents not matching requested labels
                 if !matches_labels(&[collection_name.clone()], &request.node_labels) {
                     continue;
                 }
@@ -200,7 +203,7 @@ impl BootstrapProvider for MongoBootstrapProvider {
             }
         }
 
-        // Send any remaining events that did not fill a complete batch.
+        // Flush remaining batch
         if !batch.is_empty() {
             total_count += batch.len();
             self.send_batch(&mut batch, event_tx).await?;
@@ -225,7 +228,7 @@ impl MongoBootstrapProvider {
 
         let mut properties = drasi_core::models::ElementPropertyMap::new();
 
-        // Map all top-level fields except _id (already encoded in element_id).
+        // Convert document fields to element properties
         for (key, value) in doc {
             if key != "_id" {
                 properties.insert(key, bson_to_element_value(value));
@@ -235,7 +238,7 @@ impl MongoBootstrapProvider {
         let metadata = ElementMetadata {
             reference: ElementReference::new(&context.source_id, &element_id),
             labels: Arc::from(vec![Arc::from(collection_name)]),
-            effective_from: 0,
+            effective_from: chrono::Utc::now().timestamp_millis() as u64, //according to a recent change in codebase
         };
 
         let element = Element::Node {
@@ -276,12 +279,7 @@ impl MongoBootstrapProvider {
     }
 }
 
-/// Resolve which collections to scan given the configured allow-list and the
-/// labels requested by the query.
-///
-/// - If `requested` is empty → scan nothing (return empty).
-/// - If `configured` is empty → scan everything in `requested`.
-/// - Otherwise → scan the intersection of `configured` and `requested`.
+/// Resolve which collections to scan based on configured and requested labels.
 fn resolve_collections_to_scan(configured: &[String], requested: &[String]) -> Vec<String> {
     if requested.is_empty() {
         warn!("No node labels requested, skipping bootstrap");
@@ -295,11 +293,7 @@ fn resolve_collections_to_scan(configured: &[String], requested: &[String]) -> V
         .collect()
 }
 
-/// Per-document label filter as recommended by the Developer Guide.
-///
-/// Returns `true` if the element should be included:
-/// - If no labels are requested → include all.
-/// - Otherwise → include if any element label is in the requested set.
+/// Check if element labels match the requested labels.
 fn matches_labels(element_labels: &[String], requested_labels: &[String]) -> bool {
     if requested_labels.is_empty() {
         return true;
@@ -424,7 +418,8 @@ mod tests {
         let provider = MongoBootstrapProvider::default();
 
         let doc = bson::doc! {
-            "_id": bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
+            "_id": bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011")
+                .expect("valid ObjectId hex string"),
             "name": "Alice",
             "age": 30_i32,
         };
@@ -450,7 +445,7 @@ mod tests {
                             "users:507f1f77bcf86cd799439011"
                         );
                         assert_eq!(metadata.reference.source_id.as_ref(), "test-source");
-                        assert_eq!(metadata.effective_from, 0);
+                        assert!(metadata.effective_from > 0, "effective_from should be set to current time");
 
                         // Labels = ["users"]
                         assert_eq!(metadata.labels.len(), 1);
@@ -459,11 +454,11 @@ mod tests {
                         // Properties should NOT contain _id, but should contain name and age
                         assert!(properties.get("_id").is_none());
                         assert_eq!(
-                            properties.get("name").unwrap(),
+                            properties.get("name").expect("'name' property should exist"),
                             &drasi_core::models::ElementValue::String(Arc::from("Alice"))
                         );
                         assert_eq!(
-                            properties.get("age").unwrap(),
+                            properties.get("age").expect("'age' property should exist"),
                             &drasi_core::models::ElementValue::Integer(30)
                         );
                     }
@@ -493,7 +488,7 @@ mod tests {
                 metadata: ElementMetadata {
                     reference: ElementReference::new("test-source", &format!("col:{i}")),
                     labels: Arc::from(vec![Arc::from("col")]),
-                    effective_from: 0,
+                    effective_from: chrono::Utc::now().timestamp_millis() as u64,
                 },
                 properties: drasi_core::models::ElementPropertyMap::new(),
             };

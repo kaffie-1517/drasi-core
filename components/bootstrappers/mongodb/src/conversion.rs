@@ -40,24 +40,21 @@ pub fn bson_to_element_value(bson: &Bson) -> ElementValue {
         Bson::Int32(i) => ElementValue::Integer(*i as i64),
         Bson::Int64(i) => ElementValue::Integer(*i),
         Bson::DateTime(dt) => {
-            // Use bson's native RFC 3339 serializer (produces "Z" suffix) to
-            // stay consistent with the shared contract (issue #227).
+            
             match dt.try_to_rfc3339_string() {
                 Ok(s) => ElementValue::String(Arc::from(s)),
                 Err(_) => {
-                    // Fallback for dates outside the representable RFC 3339 range.
+                    // Fallback for out-of-range dates
                     ElementValue::String(Arc::from(format!("{}", dt.timestamp_millis())))
                 }
             }
         }
         Bson::ObjectId(oid) => ElementValue::String(Arc::from(oid.to_hex())),
         Bson::Binary(bin) => {
-            // Contract: Binary → String (Base64 encoded)
             use base64::{engine::general_purpose, Engine as _};
             ElementValue::String(Arc::from(general_purpose::STANDARD.encode(&bin.bytes)))
         }
         Bson::Decimal128(d) => {
-            // Use string representation to preserve full precision.
             ElementValue::String(Arc::from(d.to_string()))
         }
         Bson::RegularExpression(regex) => {
@@ -68,8 +65,7 @@ pub fn bson_to_element_value(bson: &Bson) -> ElementValue {
             ElementValue::String(Arc::from(code_with_scope.code.as_str()))
         }
         Bson::Timestamp(ts) => {
-            // MongoDB internal Timestamp (not wall-clock DateTime). Encode as
-            // a single i64 so callers can unpack time and increment if needed.
+            // Pack time and increment into a single i64
             let val = ((ts.time as i64) << 32) | (ts.increment as i64);
             ElementValue::Integer(val)
         }
@@ -107,42 +103,44 @@ mod tests {
 
     #[test]
     fn test_extract_element_id_objectid() {
-        let oid = ObjectId::from_str("507f1f77bcf86cd799439011").unwrap();
+        let oid = ObjectId::from_str("507f1f77bcf86cd799439011")
+            .expect("valid ObjectId hex string");
         let doc = doc! { "_id": oid };
-        let id = extract_element_id(&doc, "users").unwrap();
+        let id = extract_element_id(&doc, "users")
+            .expect("should extract element ID from ObjectId");
         assert_eq!(id, "users:507f1f77bcf86cd799439011");
     }
 
     #[test]
     fn test_extract_element_id_string() {
         let doc = doc! { "_id": "user-alice-123" };
-        let id = extract_element_id(&doc, "users").unwrap();
+        let id = extract_element_id(&doc, "users")
+            .expect("should extract element ID from String");
         assert_eq!(id, "users:user-alice-123");
     }
 
     #[test]
     fn test_extract_element_id_int32() {
         let doc = doc! { "_id": 12345_i32 };
-        let id = extract_element_id(&doc, "orders").unwrap();
+        let id = extract_element_id(&doc, "orders")
+            .expect("should extract element ID from Int32");
         assert_eq!(id, "orders:12345");
     }
 
     #[test]
     fn test_extract_element_id_int64() {
         let doc = doc! { "_id": 9_876_543_210_i64 };
-        let id = extract_element_id(&doc, "events").unwrap();
+        let id = extract_element_id(&doc, "events")
+            .expect("should extract element ID from Int64");
         assert_eq!(id, "events:9876543210");
     }
 
     #[test]
     fn test_extract_element_id_missing_field() {
         let doc = doc! { "name": "Alice" };
-        let result = extract_element_id(&doc, "users");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing required '_id'"));
+        let err = extract_element_id(&doc, "users")
+            .expect_err("should fail for missing _id");
+        assert!(err.to_string().contains("missing required '_id'"));
     }
 
     #[test]
@@ -202,7 +200,8 @@ mod tests {
 
     #[test]
     fn test_objectid_to_hex_string() {
-        let oid = ObjectId::from_str("507f1f77bcf86cd799439011").unwrap();
+        let oid = ObjectId::from_str("507f1f77bcf86cd799439011")
+            .expect("valid ObjectId hex string");
         let val = bson_to_element_value(&Bson::ObjectId(oid));
         assert_eq!(val, ElementValue::String(Arc::from("507f1f77bcf86cd799439011")));
     }
@@ -267,7 +266,7 @@ mod tests {
         let doc = doc! { "list": ["a", "b", 1_i32] };
         let val = bson_to_element_value(&Bson::Document(doc));
         if let ElementValue::Object(map) = val {
-            let list = map.get("list").unwrap();
+            let list = map.get("list").expect("'list' key should exist");
             if let ElementValue::List(items) = list {
                 assert_eq!(items.len(), 3);
                 assert!(matches!(items[0], ElementValue::String(_)));
@@ -290,7 +289,7 @@ mod tests {
         };
         let val = bson_to_element_value(&Bson::Document(doc));
         if let ElementValue::Object(map) = val {
-            let nested = map.get("nested").unwrap();
+            let nested = map.get("nested").expect("'nested' key should exist");
             if let ElementValue::Object(inner) = nested {
                 assert_eq!(inner.get("a"), Some(&ElementValue::Integer(1)));
                 assert_eq!(inner.get("b"), Some(&ElementValue::Bool(true)));

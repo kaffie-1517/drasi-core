@@ -31,9 +31,7 @@ use testcontainers_modules::mongo::Mongo;
 
 use drasi_bootstrap_mongodb::MongoBootstrapProvider;
 
-/// Helper: start a MongoDB replica set container and return (container, connection_url).
-///
-/// The container must be kept alive for the duration of the test; dropping it stops MongoDB.
+/// Start a MongoDB replica set container and return (container, connection_url).
 async fn start_mongo_replica_set(
 ) -> (testcontainers::ContainerAsync<Mongo>, String) {
     let container = Mongo::repl_set()
@@ -52,7 +50,7 @@ async fn start_mongo_replica_set(
     (container, url)
 }
 
-/// Helper: create a standard BootstrapRequest for testing.
+/// Create a standard BootstrapRequest for testing.
 fn make_request(node_labels: Vec<&str>) -> BootstrapRequest {
     BootstrapRequest {
         query_id: "test-query".to_string(),
@@ -62,13 +60,12 @@ fn make_request(node_labels: Vec<&str>) -> BootstrapRequest {
     }
 }
 
-/// Helper: create a BootstrapContext.
+/// Create a BootstrapContext.
 fn make_context() -> BootstrapContext {
     BootstrapContext::new_minimal("test-server".to_string(), "test-source".to_string())
 }
 
-/// Full end-to-end test: insert documents into a real MongoDB, run bootstrap,
-/// and verify the events received match the inserted data.
+/// End-to-end test: insert documents, run bootstrap, verify events.
 #[tokio::test]
 #[ignore]
 async fn test_bootstrap_with_real_mongodb() {
@@ -175,8 +172,6 @@ async fn test_bootstrap_empty_collection() {
         .await
         .expect("Failed to connect to MongoDB");
     let db = client.database("testdb");
-    // Creating a collection by inserting and then deleting, or just using
-    // create_collection. We'll use create_collection.
     db.create_collection("empty_col", None)
         .await
         .expect("Failed to create collection");
@@ -220,7 +215,7 @@ async fn test_bootstrap_label_filtering() {
             None,
         )
         .await
-        .unwrap();
+        .expect("Failed to insert users");
 
     let orders = db.collection::<bson::Document>("orders");
     orders
@@ -233,7 +228,7 @@ async fn test_bootstrap_label_filtering() {
             None,
         )
         .await
-        .unwrap();
+        .expect("Failed to insert orders");
 
     let provider = MongoBootstrapProvider::builder()
         .with_connection_string(&url)
@@ -277,7 +272,8 @@ async fn test_bootstrap_bson_type_conversion() {
     let db = client.database("testdb");
     let coll = db.collection::<bson::Document>("typed_data");
 
-    let oid = bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap();
+    let oid = bson::oid::ObjectId::parse_str("507f1f77bcf86cd799439011")
+        .expect("valid ObjectId hex string");
     let dt = bson::DateTime::from_millis(1705312800000); // 2024-01-15T10:00:00Z
 
     coll.insert_one(
@@ -331,42 +327,42 @@ async fn test_bootstrap_bson_type_conversion() {
 
             // String
             assert_eq!(
-                properties.get("string_field").unwrap(),
+                properties.get("string_field").expect("'string_field' should exist"),
                 &ElementValue::String(Arc::from("hello"))
             );
 
             // Int32 → Integer (as i64)
             assert_eq!(
-                properties.get("int32_field").unwrap(),
+                properties.get("int32_field").expect("'int32_field' should exist"),
                 &ElementValue::Integer(42)
             );
 
             // Int64 → Integer
             assert_eq!(
-                properties.get("int64_field").unwrap(),
+                properties.get("int64_field").expect("'int64_field' should exist"),
                 &ElementValue::Integer(1234567890123)
             );
 
             // Double → Float
             assert_eq!(
-                properties.get("double_field").unwrap(),
+                properties.get("double_field").expect("'double_field' should exist"),
                 &ElementValue::Float(ordered_float::OrderedFloat(3.14))
             );
 
             // Boolean
             assert_eq!(
-                properties.get("bool_field").unwrap(),
+                properties.get("bool_field").expect("'bool_field' should exist"),
                 &ElementValue::Bool(true)
             );
 
             // Null
             assert_eq!(
-                properties.get("null_field").unwrap(),
+                properties.get("null_field").expect("'null_field' should exist"),
                 &ElementValue::Null
             );
 
             // DateTime → String (RFC 3339 with Z suffix)
-            if let ElementValue::String(s) = properties.get("datetime_field").unwrap() {
+            if let ElementValue::String(s) = properties.get("datetime_field").expect("'datetime_field' should exist") {
                 assert!(
                     s.ends_with('Z'),
                     "DateTime should end with 'Z', got: {s}"
@@ -380,10 +376,10 @@ async fn test_bootstrap_bson_type_conversion() {
             }
 
             // Nested Document → Object
-            if let ElementValue::Object(obj) = properties.get("nested_doc").unwrap() {
-                assert_eq!(obj.get("a").unwrap(), &ElementValue::Integer(1));
+            if let ElementValue::Object(obj) = properties.get("nested_doc").expect("'nested_doc' should exist") {
+                assert_eq!(obj.get("a").expect("'a' should exist"), &ElementValue::Integer(1));
                 assert_eq!(
-                    obj.get("b").unwrap(),
+                    obj.get("b").expect("'b' should exist"),
                     &ElementValue::String(Arc::from("two"))
                 );
             } else {
@@ -391,7 +387,7 @@ async fn test_bootstrap_bson_type_conversion() {
             }
 
             // Array → List
-            if let ElementValue::List(list) = properties.get("array_field").unwrap() {
+            if let ElementValue::List(list) = properties.get("array_field").expect("'array_field' should exist") {
                 assert_eq!(list.len(), 3);
                 assert_eq!(list[0], ElementValue::Integer(1));
                 assert_eq!(list[1], ElementValue::Integer(2));
@@ -430,14 +426,6 @@ async fn test_bootstrap_nonexistent_collection() {
 }
 
 /// Test that a connection string with embedded credentials works correctly.
-///
-/// This validates the maintainer's requirement: in production, the entire
-/// `connection_string` value is sourced from a Kubernetes Secret or
-/// environment variable, keeping credentials out of plain-text configuration.
-///
-/// The test creates a MongoDB user, seeds data, then bootstraps using a
-/// connection string with `user:pass@` embedded — proving the full
-/// credential flow works end-to-end.
 #[tokio::test]
 #[ignore]
 async fn test_bootstrap_with_credentials() {
